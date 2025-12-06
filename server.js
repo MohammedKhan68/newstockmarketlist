@@ -1,4 +1,7 @@
-// server.js (CommonJS) - safe, with retries, caching and CORS
+// server.js
+// Express proxy: Finnhub (quotes) + Twelve Data (daily history) + FMP (price target)
+// CommonJS, no top-level await. Requires env vars: FINNHUB_KEY, TWELVE_KEY, FMP_KEY (FMP optional)
+
 const express = require('express');
 const fetch = require('node-fetch');
 const NodeCache = require('node-cache');
@@ -6,23 +9,30 @@ const pLimit = require('p-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const FINNHUB_KEY = process.env.FINNHUB_KEY;
+
+const FINNHUB_KEY = process.env.FINNHUB_KEY || '';
+const TWELVE_KEY = process.env.TWELVE_KEY || '';
+const FMP_KEY = process.env.FMP_KEY || ''; // optional
+
 if (!FINNHUB_KEY) {
-  console.error('ERROR: FINNHUB_KEY env var is not set. Set it in Render environment variables.');
-  // continue so Render logs this clearly
+  console.warn('Warning: FINNHUB_KEY is not set. Quotes will fail without it.');
+}
+if (!TWELVE_KEY) {
+  console.warn('Warning: TWELVE_KEY is not set. Candle/history will fail without it.');
 }
 
-const CACHE_TTL = 30; // seconds
+const CACHE_TTL = 30; // seconds - increase if you want fewer external calls
 const cache = new NodeCache({ stdTTL: CACHE_TTL });
-const limit = pLimit(6); // server-side concurrency for external calls
+const concurrencyLimit = 6;
+const limit = pLimit(concurrencyLimit);
 
-// helper fetch with timeout + retries
+// helper: fetch JSON with retries
 async function fetchJson(url, opts = {}, retries = 2, backoff = 700) {
   for (let i = 0; i <= retries; ++i) {
     try {
       const res = await fetch(url, opts);
       if (!res.ok) {
-        const txt = await res.text().catch(()=>'');
+        const txt = await res.text().catch(() => '');
         throw new Error(`HTTP ${res.status} ${txt}`);
       }
       const json = await res.json();
@@ -34,31 +44,61 @@ async function fetchJson(url, opts = {}, retries = 2, backoff = 700) {
   }
 }
 
-// Finnhub wrappers
+// Finnhub: quote
 async function getQuote(symbol) {
+  if (!FINNHUB_KEY) throw new Error('FINNHUB_KEY not set');
   const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_KEY}`;
   return await fetchJson(url);
 }
 
+// Twelve Data: daily time series -> returns { s:'ok', c:[], t:[] } (c = closes, t = unix timestamps)
 async function getCandles(symbol) {
-  const to = Math.floor(Date.now() / 1000);
-  const from = to - (450 * 24 * 3600); // ~450 days for safe history
-  const url = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${to}&token=${FINNHUB_KEY}`;
-  return await fetchJson(url);
+  if (!TWELVE_KEY) throw new Error('TWELVE_KEY not set');
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=500&format=JSON&apikey=${TWELVE_KEY}`;
+  const json = await fetchJson(url);
+  // Twelve Data returns { status: 'ok', meta: {...}, values: [{datetime, close}, ...] } or error object
+  if (!json || json.status === 'error' || !Array.isArray(json.values) || json.values.length === 0) {
+    throw new Error('TwelveData error: ' + JSON.stringify(json).slice(0,300));
+  }
+  // values are newest-first; convert to oldest->newest arrays
+  const values = json.values.slice().reverse();
+  const c = values.map(v => Number(v.close));
+  const t = values.map(v => Math.floor(new Date(v.datetime).getTime() / 1000));
+  return { s: 'ok', c, t, meta: json.meta || null };
 }
 
+// FinancialModelingPrep: price target (returns number or null)
 async function getTarget(symbol) {
-  const url = `https://finnhub.io/api/v1/stock/price-target?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_KEY}`;
-  return await fetchJson(url);
+  if (!FMP_KEY) {
+    // If not configured, simply return null silently
+    return null;
+  }
+  // FMP endpoint returns array or object
+  const url = `https://financialmodelingprep.com/api/v3/price-target/${encodeURIComponent(symbol)}?apikey=${FMP_KEY}`;
+  const json = await fetchJson(url);
+  if (!json) return null;
+  if (Array.isArray(json) && json.length > 0) {
+    const first = json[0];
+    const val = first.price || first.target || first.targetMean || first['1yTargetMean'] || null;
+    return val ? Number(val) : null;
+  }
+  if (typeof json === 'object') {
+    const val = json.price || json.target || json.targetMean || json['1yTargetMean'] || null;
+    return val ? Number(val) : null;
+  }
+  return null;
 }
 
-// CORS middleware - allow all origins (safe for a public proxy)
+// Simple CORS allow-all for public proxy
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   next();
 });
 
-// API endpoint
+// Health
+app.get('/', (req, res) => res.send('rot-proxy ok'));
+
+// Main endpoint: /api/watch?symbols=AAPL,MSFT,...
 app.get('/api/watch', async (req, res) => {
   try {
     const symbolsParam = req.query.symbols || 'META,AAPL,MSFT,GOOGL,AMZN,NVDA,TSLA,CRM,SHOP,ADBE';
@@ -69,23 +109,21 @@ app.get('/api/watch', async (req, res) => {
       return res.json({ cached: true, results: cached });
     }
 
-    // create limited parallel tasks
     const tasks = symbols.map(sym => limit(async () => {
       const out = { symbol: sym, quote: null, candles: null, target: null, errors: {} };
 
-      // fetch quote
+      // quote (finnhub)
       try {
         out.quote = await getQuote(sym);
       } catch (e) {
         out.errors.quote = String(e.message || e);
       }
 
-      // fetch candles
+      // candles (twelve data)
       try {
         const c = await getCandles(sym);
-        // validate
         if (!c || c.s !== 'ok' || !Array.isArray(c.c) || c.c.length === 0) {
-          out.errors.candles = 'Invalid candles response: ' + JSON.stringify(c).slice(0,256);
+          out.errors.candles = 'Invalid candles response: ' + JSON.stringify(c).slice(0,300);
         } else {
           out.candles = c;
         }
@@ -93,10 +131,10 @@ app.get('/api/watch', async (req, res) => {
         out.errors.candles = String(e.message || e);
       }
 
-      // fetch price target (optional)
+      // price target (FMP)
       try {
         const t = await getTarget(sym);
-        out.target = t || null;
+        out.target = t !== undefined ? t : null;
       } catch (e) {
         out.errors.target = String(e.message || e);
       }
@@ -108,15 +146,12 @@ app.get('/api/watch', async (req, res) => {
     cache.set(cacheKey, results);
     return res.json({ cached: false, results });
   } catch (err) {
-    console.error('Server error in /api/watch:', err);
+    console.error('Server error /api/watch:', err);
     return res.status(500).json({ error: String(err.message || err) });
   }
 });
 
-// health
-app.get('/', (req, res) => res.send('rot-proxy ok'));
-
-// start
+// Start server
 app.listen(PORT, () => {
   console.log(`rot-proxy listening on port ${PORT}`);
 });
