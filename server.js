@@ -46,18 +46,36 @@ app.get('/api/watch', async (req,res)=>{
     if(cached) return res.json({ cached: true, results: cached });
 
     const tasks = symbols.map(sym => limit(async () => {
-      // parallel server-side
-      const [quote, candles, target] = await Promise.allSettled([
-        getQuote(sym),
-        getCandles(sym),
-        getTarget(sym)
-      ]);
-      return {
-        symbol: sym,
-        quote: quote.status === 'fulfilled' ? quote.value : null,
-        candles: candles.status === 'fulfilled' ? candles.value : null,
-        target: target.status === 'fulfilled' ? target.value : null
-      };
+      // For each symbol, attempt quote, candles, target and capture errors
+      const result = { symbol: sym, quote: null, candles: null, target: null, errors: {} };
+
+      try {
+        const q = await getQuote(sym);
+        result.quote = q;
+      } catch(e){
+        result.errors.quote = e.message || String(e);
+      }
+
+      try {
+        const c = await getCandles(sym);
+        // Validate response: Finnhub returns { s: 'ok', c: [...], t: [...] }
+        if(!c || c.s !== 'ok' || !Array.isArray(c.c) || c.c.length === 0) {
+          throw new Error('Invalid candles response: ' + JSON.stringify(c).slice(0,200));
+        }
+        result.candles = c;
+      } catch(e){
+        result.errors.candles = e.message || String(e);
+      }
+
+      try {
+        const t = await getTarget(sym);
+        // Accept null/empty as legitimate — but include raw value if present
+        result.target = t || null;
+      } catch(e){
+        result.errors.target = e.message || String(e);
+      }
+
+      return result;
     }));
 
     const results = await Promise.all(tasks);
@@ -69,4 +87,15 @@ app.get('/api/watch', async (req,res)=>{
   }
 });
 
+
+    const results = await Promise.all(tasks);
+    cache.set(cacheKey, results);
+    res.json({ cached: false, results });
+  } catch (err){
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, ()=> console.log('Listening on', PORT));
+
